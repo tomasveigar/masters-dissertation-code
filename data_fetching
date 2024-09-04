@@ -1,0 +1,114 @@
+from newsdataapi import NewsDataApiClient
+import sqlite3
+
+# Initialize the client
+api_key = 'your-api here'
+api = NewsDataApiClient(apikey=api_key)
+
+# Define query parameters for multiple stocks
+stock_queries = {
+    'ADI': "Analog Devices",
+    'AMD': "AMD OR Advanced Micro Devices OR Dr. Lisa Su",
+    'AVGO': "AVGO OR Broadcom",
+    'INTC': "INTC OR Intel",
+    'MCHP': "MCHP OR Microchip Technology",
+    'MPWR': "MPWR OR Monolithic Power Systems",
+    'MU': "MU OR Micron Technology",
+    'NVDA': "NVDA OR NVIDIA",
+    'NXPI': "NXPI OR NXP Semiconductors",
+    'ON': "ON Semiconductor OR onsemi",
+    'QCOM': "QCOM OR QUALCOMM",
+    'QRVO': "QRVO OR Qorvo",
+    'TXN': "TXN OR Texas Instruments"
+}
+
+from_date = '2023-07-19'
+to_date = '2024-07-18'
+
+categories = ['top', 'business', 'technology', 'entertainment', 'world']
+
+conn = sqlite3.connect('sqlite.db')
+c = conn.cursor()
+
+# Create table
+c.execute('''
+          CREATE TABLE IF NOT EXISTS articles
+          (id INTEGER PRIMARY KEY AUTOINCREMENT,
+          stock TEXT,
+          title TEXT,
+          description TEXT,
+          content TEXT,
+          pubDate TEXT,
+          link TEXT,
+          source TEXT,
+          source_priority INTEGER,
+          category TEXT,
+          sentiment REAL)
+          ''')
+
+conn.commit()
+
+# Function to fetch and store articles with pagination
+def fetch_and_store_articles(stock, query, from_date, to_date, page=None):
+    params = {
+        'q': query,
+        'from_date': from_date,
+        'to_date': to_date,
+        'language': 'en',
+        'page': page
+    }
+    response = api.archive_api(**params)
+    
+    # Print the entire response for debugging
+    print(f"Raw response for {stock}: {response}")
+
+    if response['status'] == 'success':
+        print(f"Success response for {stock}: Found {response['totalResults']} articles")
+        if 'results' in response and response['results']:
+            for article in response['results']:
+                title = article.get('title', 'No Title')
+                description = article.get('description', 'No Description')
+                content = article.get('content', 'No Content')
+                pubDate = article.get('pubDate', 'No Date')
+                link = article.get('link', 'No Link')
+                source = article.get('source_id', 'Unknown Source')
+                source_priority = article.get('source_priority', None)
+                
+                category = article.get('category', [])
+                if isinstance(category, list):
+                    category = ", ".join(category).lower()
+                else:
+                    category = category.lower()
+
+                # Filter articles by category and handle case where content is None
+                if any(cat in category for cat in categories) and content:
+                    # Insert article into the database
+                    c.execute('''
+                              INSERT INTO articles (stock, title, description, content, pubDate, link, source, source_priority, category)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              ''', (stock, title, description, content, pubDate, link, source, source_priority, category))
+                    
+                    # Print the article details
+                    print(f"Inserted article with Title: {title}, Published Date: {pubDate}")
+                    # Commit after each insert to ensure all data is saved
+                    conn.commit()
+
+            # Fetch next page if available
+            next_page = response.get('nextPage')
+            if next_page:
+                fetch_and_store_articles(stock, query, from_date, to_date, next_page)
+        else:
+            print(f"No articles found for {stock}.")
+    else:
+        print(f"Error fetching data for {stock}: {response}")
+
+# Loop through each stock and fetch articles
+for stock, query in stock_queries.items():
+    try:
+        print(f"Fetching articles for {stock} with query: {query}")
+        fetch_and_store_articles(stock, query, from_date, to_date)
+    except Exception as e:
+        print(f"An error occurred while processing {stock}: {e}")
+
+# Close the connection
+conn.close()
