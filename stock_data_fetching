@@ -1,0 +1,49 @@
+import yfinance as yf
+import sqlite3
+
+# Define the stock symbols
+stocks = ['ADI', 'AMD', 'AVGO', 'INTC', 'MCHP', 'MPWR', 'MU', 'NVDA', 'NXPI', 'ON', 'QCOM', 'QRVO', 'TXN']
+
+# Define the date range
+start_date = '2023-07-22'
+end_date = '2024-07-22'
+
+# Connect to SQLite database (or create it if it doesn't exist)
+conn = sqlite3.connect('dissertation_database.db')
+c = conn.cursor()
+
+# Create a new table for stock data
+c.execute('''
+          CREATE TABLE IF NOT EXISTS stock_data (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          stock TEXT,
+          date TEXT,
+          open REAL,
+          high REAL,
+          low REAL,
+          close REAL,
+          adj_close REAL,
+          volume INTEGER)
+          ''')
+
+conn.commit()
+
+# Fetch and insert data for each stock
+for stock in stocks:
+    print(f"Fetching data for {stock}")
+    data = yf.download(stock, start=start_date, end=end_date)
+    data.reset_index(inplace=True)
+    data['stock'] = stock
+    
+    # Rename the 'Adj Close' column to 'adj_close' to match the database schema
+    data.rename(columns={'Adj Close': 'adj_close'}, inplace=True)
+   
+    # Insert data into the database
+    data.to_sql('stock_data', conn, if_exists='append', index=False)
+
+# Verify insertion
+c.execute('SELECT * FROM stock_data LIMIT 5')
+print(c.fetchall())
+
+# Close the connection
+conn.close()
