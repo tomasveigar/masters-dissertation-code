@@ -1,0 +1,320 @@
+import os
+import sqlite3
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, KFold
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras import backend as K
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, explained_variance_score
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+output_folder = 'fnn_results'
+os.makedirs(output_folder, exist_ok=True)
+
+
+conn = sqlite3.connect('dissertation_database.db')
+query = """
+SELECT stock, pubdate, sentiment, open, high, low, close, adj_close, volume, source_priority
+FROM merged_data
+"""
+df = pd.read_sql(query, conn)
+conn.close()
+df['pubdate'] = pd.to_datetime(df['pubdate'])
+
+
+def assign_weights(df):
+    quantiles = df['source_priority'].quantile([0.5, 0.75])
+    conditions = [
+        df['source_priority'] <= quantiles[0.5],
+        (df['source_priority'] > quantiles[0.5]) & (df['source_priority'] <= quantiles[0.75]),
+        df['source_priority'] > quantiles[0.75]
+    ]
+    weights = [0.5, 1.0, 1.5]
+    df['weight'] = np.select(conditions, weights, default=1.0)
+    return df
+
+df = assign_weights(df)
+
+positive_df = df[df['sentiment'] > 0].copy()
+negative_df = df[df['sentiment'] < 0].copy()
+
+
+def create_features(df, lags, durations):
+    for lag in lags:
+        df.loc[:, f'sentiment_lag_{lag}'] = df.groupby('stock')['sentiment'].shift(lag)
+    for duration in durations:
+        df.loc[:, f'sentiment_mean_{duration}'] = df.groupby('stock')['sentiment'].transform(lambda x: x.rolling(duration).mean())
+    df = df.dropna()
+    return df
+
+lags = [1, 2, 3, 4, 5]
+durations = [3, 5, 7, 10, 14]
+
+positive_df = create_features(positive_df, lags, durations)
+negative_df = create_features(negative_df, lags, durations)
+
+
+def create_model(input_dim):
+    model = Sequential()
+    model.add(Dense(64, input_dim=input_dim, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='mse', weighted_metrics=['mse'])
+    return model
+
+
+def calculate_metrics(y_true, y_pred):
+    metrics = {
+        'MAE': mean_absolute_error(y_true, y_pred),
+        'MSE': mean_squared_error(y_true, y_pred),
+        'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'MAPE': np.mean(np.abs((y_true - y_pred) / y_true)) * 100,
+        'R2': r2_score(y_true, y_pred),
+        'Explained Variance': explained_variance_score(y_true, y_pred),
+        'STD': np.std(y_pred - y_true)
+    }
+    return metrics
+
+
+def single_train_test_split(df, lags, durations):
+    X = df[[f'sentiment_lag_{lag}' for lag in lags] + [f'sentiment_mean_{duration}' for duration in durations]]
+    y = df['close']
+    weights = df['weight']
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(X_scaled, y, weights, test_size=0.2, random_state=42)
+    
+    model = create_model(X_train.shape[1])
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.2, sample_weight=weights_train, callbacks=[early_stopping], verbose=1)
+    val_loss = model.evaluate(X_test, y_test, sample_weight=weights_test, verbose=1)
+    print(f'Single Split Validation Loss: {val_loss}')
+    
+    return model, history, val_loss, X_test, y_test
+
+
+print("Single train-test split for positive sentiment...")
+positive_model_single, positive_history_single, positive_val_loss_single, X_positive_test, y_positive_test = single_train_test_split(positive_df, lags, durations)
+
+
+print("Single train-test split for negative sentiment...")
+negative_model_single, negative_history_single, negative_val_loss_single, X_negative_test, y_negative_test = single_train_test_split(negative_df, lags, durations)
+
+def cross_validate_model(df, lags, durations, k=5):
+    X = df[[f'sentiment_lag_{lag}' for lag in lags] + [f'sentiment_mean_{duration}' for duration in durations]]
+    y = df['close']
+    weights = df['weight']
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    kf = KFold(n_splits=k, shuffle=True, random_state=42)
+    val_losses = []
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    
+    for train_index, val_index in kf.split(X_scaled):
+        X_train, X_val = X_scaled[train_index], X_scaled[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+        weights_train, weights_val = weights.iloc[train_index], weights.iloc[val_index]
+        
+        model = create_model(X_train.shape[1])
+        
+        history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_val, y_val), sample_weight=weights_train, callbacks=[early_stopping], verbose=0)
+        val_loss = model.evaluate(X_val, y_val, sample_weight=weights_val, verbose=0)
+        val_losses.append(val_loss)
+        
+        
+        K.clear_session()
+    
+    avg_val_loss = np.mean(val_losses)
+    print(f'Average Validation Loss: {avg_val_loss}')
+    
+    return model, history, avg_val_loss, X_val, y_val
+
+
+print("Cross-validating model for positive sentiment...")
+positive_model_cv, positive_history_cv, positive_avg_val_loss_cv, X_positive_cv_val, y_positive_cv_val = cross_validate_model(positive_df, lags, durations)
+
+
+print("Cross-validating model for negative sentiment...")
+negative_model_cv, negative_history_cv, negative_avg_val_loss_cv, X_negative_cv_val, y_negative_cv_val = cross_validate_model(negative_df, lags, durations)
+
+
+def analyze_weights(model, lags, durations, sentiment_type):
+    weights = model.layers[0].get_weights()[0]
+    num_lags = len(lags)
+    num_durations = len(durations)
+
+    lag_weights = weights[:num_lags]
+    duration_weights = weights[num_lags:num_lags + num_durations]
+
+    lag_weights_mean = np.mean(lag_weights, axis=1)
+    duration_weights_mean = np.mean(duration_weights, axis=1)
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(range(1, num_lags + 1), lag_weights_mean, tick_label=lags)
+    plt.xlabel('Lag (days)')
+    plt.ylabel('Weight')
+    plt.title(f'Weights of Lag Features ({sentiment_type} Sentiment)')
+    plt.savefig(os.path.join(output_folder, f'{sentiment_type}_lag_weights_single_split.png'))
+    plt.close()
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(range(1, num_durations + 1), duration_weights_mean, tick_label=durations)
+    plt.xlabel('Duration (days)')
+    plt.ylabel('Weight')
+    plt.title(f'Weights of Duration Features ({sentiment_type} Sentiment)')
+    plt.savefig(os.path.join(output_folder, f'{sentiment_type}_duration_weights_single_split.png'))
+    plt.close()
+
+    lag_mean = np.mean(lag_weights_mean)
+    lag_std = np.std(lag_weights_mean)
+    duration_mean = np.mean(duration_weights_mean)
+    duration_std = np.std(duration_weights_mean)
+
+    print(f'{sentiment_type} Sentiment - Lag Weights - Mean: {lag_mean}, Std: {lag_std}')
+    print(f'{sentiment_type} Sentiment - Duration Weights - Mean: {duration_mean}, Std: {duration_std}')
+
+
+def plot_training_history(history, sentiment_type):
+    plt.figure(figsize=(10, 5))
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Training and Validation Loss ({sentiment_type} Sentiment)')
+    plt.legend()
+    plt.savefig(os.path.join(output_folder, f'{sentiment_type}_training_history.png'))
+    plt.close()
+
+
+print("Analyzing weights for positive sentiment (single split)...")
+analyze_weights(positive_model_single, lags, durations, "Positive (Single Split)")
+
+
+print("Plotting training history for positive sentiment (single split)...")
+plot_training_history(positive_history_single, "Positive (Single Split)")
+
+
+print("Analyzing weights for negative sentiment (single split)...")
+analyze_weights(negative_model_single, lags, durations, "Negative (Single Split)")
+
+
+print("Plotting training history for negative sentiment (single split)...")
+plot_training_history(negative_history_single, "Negative (Single Split)")
+
+
+print("Analyzing weights for positive sentiment (cross-validation)...")
+analyze_weights(positive_model_cv, lags, durations, "Positive (Cross-Validation)")
+
+
+print("Plotting training history for positive sentiment (cross-validation)...")
+plot_training_history(positive_history_cv, "Positive (Cross-Validation)")
+
+print("Analyzing weights for negative sentiment (cross-validation)...")
+analyze_weights(negative_model_cv, lags, durations, "Negative (Cross-Validation)")
+
+
+print("Plotting training history for negative sentiment (cross-validation)...")
+plot_training_history(negative_history_cv, "Negative (Cross-Validation)")
+
+def plot_heatmap(model, lags, durations, sentiment_type):
+    weights = model.layers[0].get_weights()[0]
+    num_lags = len(lags)
+    num_durations = len(durations)
+    
+    lag_weights = weights[:num_lags]
+    duration_weights = weights[num_lags:num_lags + num_durations]
+    
+   
+    lag_weights_mean = np.mean(lag_weights, axis=1).reshape(-1, 1)
+    duration_weights_mean = np.mean(duration_weights, axis=1).reshape(-1, 1)
+    
+    lag_df = pd.DataFrame(lag_weights_mean, index=[f'Lag {i+1}' for i in range(num_lags)], columns=['Weight'])
+    duration_df = pd.DataFrame(duration_weights_mean, index=[f'Duration {d}' for d in durations], columns=['Weight'])
+
+    min_weight = min(lag_weights_mean.min(), duration_weights_mean.min())
+    max_weight = max(lag_weights_mean.max(), duration_weights_mean.max())
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    sns.heatmap(lag_df, annot=True, cmap='RdYlGn', cbar=True, vmin=min_weight, vmax=max_weight)
+    plt.title(f'Lag Weights Heatmap ({sentiment_type} Sentiment)')
+    
+    plt.subplot(1, 2, 2)
+    sns.heatmap(duration_df, annot=True, cmap='RdYlGn', cbar=True, vmin=min_weight, vmax=max_weight)
+    plt.title(f'Duration Weights Heatmap ({sentiment_type} Sentiment)')
+    
+    plt.subplots_adjust(top=0.85, bottom=0.15)
+    plt.savefig(os.path.join(output_folder, f'{sentiment_type}_heatmap.png'))
+    plt.close()
+
+
+plot_heatmap(positive_model_single, lags, durations, "Positive (Single Split)")
+
+plot_heatmap(negative_model_single, lags, durations, "Negative (Single Split)")
+
+plot_heatmap(positive_model_cv, lags, durations, "Positive (Cross-Validation)")
+
+plot_heatmap(negative_model_cv, lags, durations, "Negative (Cross-Validation)")
+
+def plot_cumulative_impact(df, sentiment_type):
+    df = df.sort_values(by='pubdate')
+    df['cumulative_sentiment'] = df['sentiment'].cumsum()
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['pubdate'], df['cumulative_sentiment'], label='Cumulative Sentiment')
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Sentiment')
+    plt.title(f'Cumulative Impact of News Sentiment ({sentiment_type} Sentiment)')
+    plt.legend()
+    plt.savefig(os.path.join(output_folder, f'{sentiment_type}_cumulative_impact.png'))
+    plt.close()
+
+
+plot_cumulative_impact(positive_df, "Positive")
+
+
+plot_cumulative_impact(negative_df, "Negative")
+
+
+results = []
+
+
+y_pred_positive = positive_model_single.predict(X_positive_test).flatten()
+metrics_positive = calculate_metrics(y_positive_test, y_pred_positive)
+metrics_positive['Model'] = 'Positive FNN (Single Split)'
+results.append(metrics_positive)
+
+y_pred_negative = negative_model_single.predict(X_negative_test).flatten()
+metrics_negative = calculate_metrics(y_negative_test, y_pred_negative)
+metrics_negative['Model'] = 'Negative FNN (Single Split)'
+results.append(metrics_negative)
+
+y_pred_positive_cv = positive_model_cv.predict(X_positive_cv_val).flatten()
+metrics_positive_cv = calculate_metrics(y_positive_cv_val, y_pred_positive_cv)
+metrics_positive_cv['Model'] = 'Positive FNN (Cross-Validation)'
+results.append(metrics_positive_cv)
+
+y_pred_negative_cv = negative_model_cv.predict(X_negative_cv_val).flatten()
+metrics_negative_cv = calculate_metrics(y_negative_cv_val, y_pred_negative_cv)
+metrics_negative_cv['Model'] = 'Negative FNN (Cross-Validation)'
+results.append(metrics_negative_cv)
+
+
+metrics_df = pd.DataFrame(results)
+
+
+print(metrics_df)
+
+
+metrics_df.to_csv(os.path.join(output_folder, 'fnn_metrics_results.csv'), index=False)
