@@ -1,0 +1,41 @@
+import sqlite3
+import pandas as pd
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import PorterStemmer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+
+nltk.download('stopwords')
+nltk.download('punkt')
+
+tconn = sqlite3.connect('stock_articles007.db')
+c = conn.cursor()
+
+df = pd.read_sql_query("SELECT * FROM articles", conn)
+
+df['title'] = df['title'].str.lower()
+df['description'] = df['description'].str.lower()
+df['content'] = df['content'].str.lower()
+
+stop_words = set(stopwords.words('english'))
+df['content'] = df['content'].apply(lambda x: ' '.join([word for word in word_tokenize(x) if word not in stop_words]))
+
+ps = PorterStemmer()
+df['content'] = df['content'].apply(lambda x: ' '.join([ps.stem(word) for word in word_tokenize(x)]))
+
+analyzer = SentimentIntensityAnalyzer()
+df['sentiment'] = df['content'].apply(lambda x: analyzer.polarity_scores(x)['compound'])
+
+
+df['pubDate'] = pd.to_datetime(df['pubDate'])
+
+df.to_sql('cleaned_articles', conn, if_exists='replace', index=False)
+
+conn.close()
+
+print("Duplicates in 'title':", df.duplicated(subset=['title']).sum())
+print("Null values in 'title':", df['title'].isnull().sum())
+print("Null values in 'description':", df['description'].isnull().sum())
+print("Null values in 'content':", df['content'].isnull().sum())
